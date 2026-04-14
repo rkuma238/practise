@@ -8,13 +8,14 @@ commentary covering:
   • Max Pain level
   • Key Support & Resistance zones
   • OI change interpretation  (Long Buildup / Short Buildup /
-                                Long Unwinding / Short Covering)
+                                Long Unwinding / Short Covering)  — ALL strikes
   • Expected intraday / weekly trading range
 
 Usage (standalone):
     python nifty_option_chain.py
 
-The scheduler (scheduler.py) calls run() automatically at 8 PM IST every day.
+The scheduler (scheduler.py) calls run() automatically at 8 PM IST every day
+and also writes the results to Google Sheets via google_sheets.py.
 """
 
 import json
@@ -171,9 +172,9 @@ def support_resistance(rows: list, top_n: int = 3) -> dict:
     }
 
 
-def oi_activity(rows: list, spot: float, window: int = 10) -> list:
+def oi_activity(rows: list) -> list:
     """
-    Classify OI activity for strikes within ±window strikes of ATM:
+    Classify OI activity for EVERY strike in the chain:
 
       Price ↑ + OI ↑  → Long Buildup   (bulls adding longs)
       Price ↑ + OI ↓  → Short Covering  (bears covering shorts)
@@ -182,15 +183,8 @@ def oi_activity(rows: list, spot: float, window: int = 10) -> list:
 
     We use `changeinOpenInterest` and `change` (price change) from NSE data.
     """
-    atm = atm_strike(spot, rows)
-    strikes_sorted = sorted(r["strikePrice"] for r in rows)
-    atm_idx = strikes_sorted.index(atm)
-    nearby = strikes_sorted[max(0, atm_idx - window): atm_idx + window + 1]
-
     activities = []
-    for r in rows:
-        if r["strikePrice"] not in nearby:
-            continue
+    for r in sorted(rows, key=lambda x: x["strikePrice"]):
         for opt_type in ("CE", "PE"):
             d = r.get(opt_type, {})
             if not d:
@@ -203,9 +197,12 @@ def oi_activity(rows: list, spot: float, window: int = 10) -> list:
                 "type":      opt_type,
                 "oi":        d.get("openInterest", 0),
                 "chg_oi":    chg_oi,
-                "chg_price": chg_price,
+                "chg_price": d.get("pChange", 0),    # % change
+                "chg_abs":   chg_price,              # absolute price change
                 "activity":  label,
                 "ltp":       d.get("lastPrice", 0),
+                "iv":        d.get("impliedVolatility", 0),
+                "volume":    d.get("totalTradedVolume", 0),
             })
     return activities
 
@@ -249,6 +246,86 @@ def expected_range(rows: list, spot: float) -> dict:
         "one_sd_upper":  round(spot + one_sd_move, 2),
         "oi_support":    oi_support,
         "oi_resistance": oi_resistance,
+    }
+
+
+# ─── Structured data (consumed by google_sheets.py) ──────────────────────────
+
+def get_structured_data(raw: dict) -> dict:
+    """
+    Return a single dict containing every computed metric.
+    This is the canonical data structure passed to google_sheets.write_to_sheet().
+    """
+    rows, spot, expiry, timestamp = nearest_expiry_data(raw)
+    atm = atm_strike(spot, rows)
+
+    pcr_data   = pcr(rows)
+    mp         = max_pain(rows)
+    sr         = support_resistance(rows, top_n=5)
+    activities = oi_activity(rows)
+    rng        = expected_range(rows, spot)
+
+    # Build a per-strike merged view (CE left, PE right) for the OI Chain tab
+    activity_map = {}
+    for a in activities:
+        activity_map[(a["strike"], a["type"])] = a
+
+    oi_chain = []
+    for r in sorted(rows, key=lambda x: x["strikePrice"]):
+        strike = r["strikePrice"]
+        ce_act = activity_map.get((strike, "CE"), {})
+        pe_act = activity_map.get((strike, "PE"), {})
+        oi_chain.append({
+            "strike": strike,
+            "atm":    strike == atm,
+            "ce": {
+                "oi":        ce_act.get("oi",        0),
+                "chg_oi":    ce_act.get("chg_oi",    0),
+                "volume":    ce_act.get("volume",     0),
+                "ltp":       ce_act.get("ltp",        0),
+                "iv":        ce_act.get("iv",         0),
+                "chg_price": ce_act.get("chg_price",  0),
+                "chg_abs":   ce_act.get("chg_abs",    0),
+                "activity":  ce_act.get("activity",  ""),
+            },
+            "pe": {
+                "oi":        pe_act.get("oi",        0),
+                "chg_oi":    pe_act.get("chg_oi",    0),
+                "volume":    pe_act.get("volume",     0),
+                "ltp":       pe_act.get("ltp",        0),
+                "iv":        pe_act.get("iv",         0),
+                "chg_price": pe_act.get("chg_price",  0),
+                "chg_abs":   pe_act.get("chg_abs",    0),
+                "activity":  pe_act.get("activity",  ""),
+            },
+        })
+
+    # Activity summary counts
+    counts: dict[str, int] = {}
+    for a in activities:
+        counts[a["activity"]] = counts.get(a["activity"], 0) + 1
+    dominant = max(counts, key=counts.get) if counts else "Unknown"
+
+    pcr_data["commentary"] = _pcr_commentary(pcr_data["pcr_oi"])
+
+    return {
+        "meta": {
+            "generated_at": datetime.datetime.now().strftime("%d-%b-%Y %H:%M"),
+            "timestamp":    timestamp,
+            "expiry":       expiry,
+            "spot":         spot,
+            "atm":          atm,
+        },
+        "pcr":                pcr_data,
+        "max_pain":           mp,
+        "range":              rng,
+        "support_resistance": sr,
+        "oi_chain":           oi_chain,
+        "activities":         activities,
+        "activity_summary": {
+            "counts":   counts,
+            "dominant": dominant,
+        },
     }
 
 
@@ -338,7 +415,7 @@ def generate_report(raw: dict) -> str:
     pcr_data   = pcr(rows)
     mp         = max_pain(rows)
     sr         = support_resistance(rows, top_n=3)
-    activities = oi_activity(rows, spot, window=10)
+    activities = oi_activity(rows)
     rng        = expected_range(rows, spot)
 
     sep = "═" * 65
@@ -363,7 +440,7 @@ def generate_report(raw: dict) -> str:
         "",
         "  " + _pcr_commentary(pcr_data["pcr_oi"]),
         "",
-        "── OI ACTIVITY (near ATM strikes) ─────────────────────────────",
+        "── OI ACTIVITY (all strikes) ───────────────────────────────────",
         _activity_summary(activities),
         "",
         "── KEY LEVELS ─────────────────────────────────────────────────",
@@ -379,20 +456,19 @@ def generate_report(raw: dict) -> str:
         "── EXPECTED RANGE ─────────────────────────────────────────────",
         _range_commentary(rng, spot, mp),
         "",
-        "── NOTABLE STRIKE ACTIVITY ────────────────────────────────────",
+        "── TOP 10 STRIKES BY OI CHANGE ────────────────────────────────",
     ]
 
-    # Show top 5 most active strikes by OI change
     notable = sorted(
         [a for a in activities if abs(a["chg_oi"]) > 0],
         key=lambda x: abs(x["chg_oi"]),
         reverse=True,
-    )[:8]
+    )[:10]
     for n in notable:
-        direction = "▲" if n["chg_price"] >= 0 else "▼"
+        direction = "▲" if n["chg_abs"] >= 0 else "▼"
         lines.append(
             f"  {n['strike']:>8} {n['type']}  LTP={n['ltp']:>7.2f}  "
-            f"ΔOI={n['chg_oi']:>+8,}  ΔPrice={n['chg_price']:>+6.2f}{direction}  "
+            f"ΔOI={n['chg_oi']:>+8,}  ΔPrice={n['chg_abs']:>+6.2f}{direction}  "
             f"→ {n['activity']}"
         )
 
@@ -408,15 +484,21 @@ def generate_report(raw: dict) -> str:
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
-def run():
-    """Fetch data and print the full report.  Called by the scheduler."""
+def run() -> dict | None:
+    """
+    Fetch data, print the full report, and return structured data dict.
+    The structured dict is consumed by google_sheets.write_to_sheet().
+    Returns None on failure.
+    """
     print(f"[{datetime.datetime.now():%H:%M:%S}] Fetching Nifty option chain data …")
     try:
         raw    = fetch_option_chain()
         report = generate_report(raw)
         print(report)
+        return get_structured_data(raw)
     except Exception as exc:
         print(f"ERROR: {exc}")
+        return None
 
 
 if __name__ == "__main__":

@@ -41,10 +41,21 @@ def job():
     """The task executed at the scheduled time."""
     log.info("=== Nifty Option Chain Analysis triggered ===")
     try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
         from nifty_option_chain import run
-        run()
+        from google_sheets import write_to_sheet
+
+        data = run()                     # fetch + print terminal report
+
+        if data:
+            log.info("Writing results to Google Sheets …")
+            write_to_sheet(data)         # push to sheets (no-op if not configured)
+        else:
+            log.warning("No data returned; skipping Google Sheets update.")
+
     except ImportError as e:
-        log.error("Could not import nifty_option_chain: %s", e)
+        log.error("Import error: %s", e)
     except Exception as e:
         log.exception("Analysis failed: %s", e)
 
